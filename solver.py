@@ -1,7 +1,11 @@
-"""Agglomerative Information Bottleneck (aIB) and Sequential Information Bottleneck (sIB) solvers."""
+"""Agglomerative Information Bottleneck (aIB), Sequential Information Bottleneck (sIB),
+and X->T->Y mapping solvers.
+"""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
 
 from data import compute_cluster_distribution
 from evaluator import entropy, js_divergence, mutual_information
@@ -232,3 +236,130 @@ def sequential_ib(
         "mi_history": best_history,
         "all_init_scores": all_init_scores,
     }
+
+
+def build_cluster_decode_table(
+    x_train: np.ndarray,
+    prob_train: np.ndarray,
+    labels: np.ndarray,
+    n_clusters: int,
+    threshold: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute cluster centroids T and posterior P(Y|T) decoding table from training clusters."""
+    x_mean = x_train.mean(axis=0)
+    p_mean = prob_train.mean(axis=0)
+
+    centroids = np.empty((n_clusters, x_train.shape[1]), dtype=np.float64)
+    p_y_given_t = np.empty((n_clusters, prob_train.shape[1]), dtype=np.float64)
+    for k in range(n_clusters):
+        mask = labels == k
+        if np.any(mask):
+            centroids[k] = x_train[mask].mean(axis=0)
+            p_y_given_t[k] = prob_train[mask].mean(axis=0)
+        else:
+            centroids[k] = x_mean
+            p_y_given_t[k] = p_mean
+
+    y_decode_table = (p_y_given_t > threshold).astype(np.int64)
+    return centroids, y_decode_table, p_y_given_t
+
+
+def nearest_centroid_predict(
+    x_test: np.ndarray, centroids: np.ndarray
+) -> np.ndarray:
+    """Assign each test sample to its nearest cluster centroid in Euclidean space."""
+    dists = cdist(np.asarray(x_test, dtype=np.float64), centroids, metric="euclidean")
+    return np.argmin(dists, axis=1)
+
+
+def knn_predict(
+    x_train: np.ndarray,
+    labels: np.ndarray,
+    x_test: np.ndarray,
+    n_clusters: int,
+    n_neighbors: int = 5,
+    weighted: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict cluster assignments via K-Nearest Neighbors (standardized Euclidean).
+
+    Returns:
+        Tuple of (train_pred, test_pred) cluster indices.
+    """
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_te = np.asarray(x_test, dtype=np.float64)
+    mu = x_tr.mean(axis=0)
+    sd = x_tr.std(axis=0) + 1e-8
+    x_tr_s = (x_tr - mu) / sd
+    x_te_s = (x_te - mu) / sd
+
+    k_eff = min(n_neighbors, len(x_tr_s))
+
+    def _vote(x_query: np.ndarray) -> np.ndarray:
+        dists = cdist(x_query, x_tr_s, metric="euclidean")
+        idx = np.argpartition(dists, k_eff - 1, axis=1)[:, :k_eff]
+        rows = np.arange(len(x_query))[:, None]
+        d_k = dists[rows, idx]
+        w_k = 1.0 / (d_k + 1e-8) if weighted else np.ones_like(d_k)
+        lbl_k = labels[idx]
+        scores = np.zeros((len(x_query), n_clusters), dtype=np.float64)
+        for c in range(n_clusters):
+            scores[:, c] = np.sum(w_k * (lbl_k == c), axis=1)
+        return np.argmax(scores, axis=1)
+
+    return _vote(x_tr_s), _vote(x_te_s)
+
+
+def svm_fit_predict(
+    x_train: np.ndarray,
+    labels: np.ndarray,
+    x_test: np.ndarray,
+    n_clusters: int,
+    C: float = 10.0,
+    gamma: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit One-vs-Rest RBF Kernel L2-SVM via L-BFGS-B and predict cluster assignments.
+
+    Returns:
+        Tuple of (train_pred, test_pred) cluster indices.
+    """
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_te = np.asarray(x_test, dtype=np.float64)
+    mu = x_tr.mean(axis=0)
+    sd = x_tr.std(axis=0) + 1e-8
+    x_tr_s = (x_tr - mu) / sd
+    x_te_s = (x_te - mu) / sd
+
+    if gamma is None:
+        gamma = 1.0 / x_tr_s.shape[1]
+
+    n = len(x_tr_s)
+    k_tr = np.exp(-gamma * cdist(x_tr_s, x_tr_s, metric="sqeuclidean"))
+    k_reg = k_tr + 1e-8 * np.eye(n)
+    k_te = np.exp(-gamma * cdist(x_te_s, x_tr_s, metric="sqeuclidean"))
+
+    scores_tr = np.full((n, n_clusters), -np.inf, dtype=np.float64)
+    scores_te = np.full((len(x_te_s), n_clusters), -np.inf, dtype=np.float64)
+
+    for c in range(n_clusters):
+        pos_mask = labels == c
+        if not np.any(pos_mask):
+            continue
+        yc = np.where(pos_mask, 1.0, -1.0)
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            beta = params[:n]
+            b = params[n]
+            f = k_tr @ beta + b
+            m = np.maximum(0.0, 1.0 - yc * f)
+            loss = float(0.5 * (beta @ (k_reg @ beta)) + C * np.sum(m ** 2))
+            g = -2.0 * C * yc * m
+            grad_beta = k_reg @ beta + k_tr @ g
+            grad_b = float(np.sum(g))
+            return loss, np.append(grad_beta, grad_b)
+
+        res = minimize(_obj, np.zeros(n + 1, dtype=np.float64), method="L-BFGS-B", jac=True)
+        beta, b = res.x[:n], res.x[n]
+        scores_tr[:, c] = k_tr @ beta + b
+        scores_te[:, c] = k_te @ beta + b
+
+    return np.argmax(scores_tr, axis=1), np.argmax(scores_te, axis=1)
